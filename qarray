@@ -1,0 +1,364 @@
+#!/usr/bin/env perl
+
+#-------------------------------------------------------------------------------
+# The MIT License (MIT)
+
+# Copyright (c) 2013 Eli Lilly
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#-------------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Basename;
+use File::Spec;
+
+my ($input_file, $opt_c, $qsub_cmdline_opts, $opt_wd, $opt_r, $help, $debug);
+
+if (!@ARGV) { pod2usage(2); }
+
+GetOptions(
+    'f|cmdfile=s'      => \$input_file,
+    'c|chunksize=i'    => \$opt_c,  
+    'qo|qsuboptions=s' => \$qsub_cmdline_opts,
+    'wd|workingdir=s'  => \$opt_wd,
+    'r|remove'         => \$opt_r,
+    'h|help|?'         => sub { pod2usage(1); },
+    'man'              => sub { pod2usage(verbose => 2); },
+    'd|debug=i'        => \$debug
+) or pod2usage(2);
+
+my $start_time = time;
+
+my $job_script = ""; # absolute path to the batch job submit script
+my $qsub_opts  = ""; # qsub options that are written in the job submit script
+my $work_dir   = ""; # (if specified by user) the job's working directory
+
+# Set debugging level and verbosity.
+
+$debug = defined($debug) ? $debug : 0;
+
+# Check for the presence of $SGE_ROOT 
+
+if (!defined($ENV{SGE_ROOT}) ) {
+  die "\$SGE_ROOT not found. Please run \$SGE_ROOT/default/common/settings.(sh|csh).\n";
+}
+
+#-------------------------------------------------------------------------------
+# Validate and set defaults for options.  We currently do not validate the 
+# -qo|qsuboptions arguement string.  This arguement string is passed directly 
+# through to the qsub command.
+#-------------------------------------------------------------------------------
+
+if (!defined($input_file)) {
+  die "The -f|cmdfile option is required\n"; 
+}
+
+my $input_fname = basename($input_file);
+my $input_fpath = File::Spec->rel2abs($input_file);
+
+if ( ! -s $input_file ) {
+  die "The -f <command file> does not exist or has zero size\n"
+}
+
+if ($debug >= 1) {
+  print STDERR "Input file (-f|cmdfile): $input_fpath\n\n";
+}
+
+$job_script .= "$input_fname\.sh";
+
+# Count the number of lines in the input command file and set the range for the
+# task array.  In addition, determine if the commands in the input file should
+# be chunked (-c|chunksize) and set the step size for the array to the chunk
+# size.  
+
+$opt_c = defined($opt_c) ? $opt_c : 1;
+
+my $line_cnt = `wc -l < $input_fpath`;
+die "wc failed: $?" if $?;
+chomp($line_cnt);
+$qsub_opts .= "#\$ -t 1\-".$line_cnt.":$opt_c\n";
+
+my ($num_of_tasks, $rem) = (int $line_cnt / $opt_c, $line_cnt % $opt_c);
+if ($rem > 0 ) { $num_of_tasks++; }
+
+if ($debug >= 1) {
+  print STDERR "The input file $input_fname has $line_cnt lines\n";
+  print STDERR "  - A task array of 1\-$num_of_tasks will be submitted\n";
+  print STDERR "  - Each task in the array will run $opt_c line(s)\n\n";
+}
+
+$qsub_cmdline_opts = defined($qsub_cmdline_opts) ? $qsub_cmdline_opts : "";
+
+# Make sure that if -wd was specfied it is a valid location.  If -wd should
+# not be specified, then use -cwd.
+
+if (defined($opt_wd) && ! -d $opt_wd )  { 
+  die "-wd|workingdir is not a valid directory path (it does not exist)\n"; 
+} elsif (!defined($opt_wd)) {
+  my $cwd = getcwd;
+  $qsub_opts .= "#\$ -cwd\n";
+} else {
+  $work_dir = File::Spec->rel2abs($opt_wd)."/";
+  $job_script = $work_dir.$job_script;
+  $qsub_opts .= "#\$ -wd $work_dir\n";
+  $qsub_opts .= "#\$ -o $work_dir\n";
+  $qsub_opts .= "#\$ -e $work_dir\n";
+}
+
+#-------------------------------------------------------------------------------
+# Create a job submit file for the task array(s)
+#-------------------------------------------------------------------------------
+
+if ($debug >= 1) { 
+  print STDERR "Creating submit script for job with 0755 permissions...";
+}
+
+my $job_submit = <<JOB_SUBMIT;
+#!/bin/bash
+#\$ -S /bin/bash
+#\$ -sync y
+$qsub_opts
+CMDFILE=$input_fpath
+CHUNK=`expr \$SGE_TASK_ID + \$SGE_TASK_STEPSIZE - 1`
+CMD=\$(sed -n "\$SGE_TASK_ID,\$CHUNK"p \$CMDFILE)
+eval "\$CMD" 
+JOB_SUBMIT
+
+open( my $SUBMITFILE, ">", $job_script) or die "Couldn't open $job_script for writing: $!\n";
+print $SUBMITFILE $job_submit;
+close($SUBMITFILE) or die "SUBMITFILE didn't close: $!\n";
+
+chmod 0755, $job_script or die $!;
+
+if ($debug >= 1) { 
+  print STDERR "done\n\n";
+}
+
+#-------------------------------------------------------------------------------
+# Submit the job to Grid Engine
+#-------------------------------------------------------------------------------
+
+if ($debug >= 1) {
+  print STDERR "Submitting task array job to cluster\n";
+  print STDERR "  - Blocking (-sync y) is enabled by default\n";
+  print STDERR "  - qsub will not return any output until all tasks in the ";
+  print STDERR "array have completed\n";
+  print STDERR "  - Use qstat to view status of your task array job\n\n";
+  print STDERR "Waiting for job to finish...";
+}
+
+my $rc = `qsub -r y $qsub_cmdline_opts $job_script`;
+
+my $job_id = '';
+my @tasks = split("\n", $rc);
+if ($tasks[0] =~ /Your job-array (\d+)\..* has been submitted/) {
+  $job_id = $1;
+} else {
+  die "your job-array submission had an unknown problem:\n".@tasks."\n"; 
+}
+
+if ($debug >= 1) {
+  print STDERR "completed\n";
+}
+
+#-------------------------------------------------------------------------------
+# Consolidate STDERR output for failed jobs into master STDERR log
+#-------------------------------------------------------------------------------
+
+if ($debug >= 1) {
+  print STDERR "Checking for failed tasks...";
+}
+
+my $errors = "";
+my $err_cnt = 0;
+foreach my $task (@tasks) {
+  if ($task =~ /Job\s(\d+)\.(\d+)\sexited with exit code (\d+)\./) {
+    if ($3 != 0) {
+      my $efile = $work_dir.$input_fname.".sh.e".$1.".".$2;
+      my $pefile = $work_dir.$input_fname.".sh.pe".$1.".".$2;
+
+      $errors .= "Job: $1.$2 (line $2 of $input_fname) failed with exit status: $3\n";
+      if (-e $efile && -s $efile) {
+        $errors .= "STDERR ($efile):\n";
+        open( my $EFILE, "<", $efile) or die "Couldn't open $efile for writing: $!\n";
+        local $/;
+        $errors .= <$EFILE>;
+        close($EFILE)
+      }
+      if (-e $pefile && -s $pefile) {
+        $errors .= "STDERR ($pefile):\n";
+        open( my $PEFILE, "<", $pefile) or die "Couldn't open $pefile for writing: $!\n";;
+        local $/;
+        $errors .= <$PEFILE>;
+        close($PEFILE)
+      }
+      $err_cnt++;
+    }
+  }
+}
+
+if ($errors ne "") {
+  open ( my $MASTER_STDERR, ">", $work_dir.$input_fname.".sh.$job_id.stderr");
+  print $MASTER_STDERR $errors;
+  close($MASTER_STDERR);
+}
+
+if ($debug >= 1) {
+  print STDERR "done\n";
+  my $ratio_ok = $num_of_tasks-$err_cnt;
+  print STDERR "$ratio_ok / $num_of_tasks tasks completed successfuly\n";
+}
+
+#-------------------------------------------------------------------------------
+# Clean up all STDOUT (*.o*, *.po.*) and STDERR (*.e*, *.pe*) log files
+#-------------------------------------------------------------------------------
+
+if (defined($opt_r)) {
+  if ($debug >= 1) {
+    print STDERR "Removing *.o* and *.e* logs from working directory...";
+  }
+  unlink glob("$work_dir*.o$job_id*");
+  unlink glob("$work_dir*.e$job_id*");
+  unlink glob("$work_dir*.po$job_id*");
+  unlink glob("$work_dir*.pe$job_id*");
+  
+  if ($debug >= 1) {
+    print STDERR "done\n";
+  }
+} else {
+  if ($debug >= 1) {
+    print STDERR "Skipped deleting *.o* and *.e* logs from working directory\n";
+  }
+}
+
+#-------------------------------------------------------------------------------
+# Calculate elapse time during which this script ran
+#-------------------------------------------------------------------------------
+
+if ($debug >= 1) {
+  my $seconds = time - $start_time;;
+  my $day = int($seconds/(24*60*60));
+  my $hrs = ($seconds/(60*60))%24;
+  my $min = ($seconds/60)%60;
+  my $sec = $seconds%60;
+
+  my $elapsed_time = sprintf("%02d",($day*24)+$hrs);
+  $elapsed_time .= ":".sprintf("%02d",$min);
+  $elapsed_time .= ":".sprintf("%02d",$sec)."\n";
+  chomp($elapsed_time);
+
+  print STDERR "File: $input_fname took $elapsed_time to execute\n";
+}
+
+exit;
+
+__END__
+
+=head1 NAME
+
+qarray - Simple script for submitting and managing task arrays in Grid Engine
+
+=head1 SYNOPSIS
+
+qarray [options] -f <command file>
+
+ Options:
+   -f	 An input file containing a list of commands.
+   -c	 The number of input lines to chunk into a single job array element.
+   -qo 	 A single-quoted string of additional options to be passed to qsub.
+   -wd   The working directory for the job.  If not specified, this script will
+         use the current working directory as the working directory for the job.
+   -d    Select the level of verbosity.  Default level is 0.
+   -help Prints the usage information for this script.
+   -man  Prints the man page for this script.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-f|cmdfile>
+
+Required.  Input text file with each line representing a individual command to
+be run as a task within a task array.
+
+=item B<-c|chunksize>
+
+Optional.  The number of input lines to chunk into a single job array element. 
+The default value is 1.  This means that each line of the input file will 
+represent a single task in the array.  If chunk size were set to 3 then every
+3 lines in the input file would represent a single task in the array.
+
+=item B<-qo|options>
+
+Optional.  A single-quoted string of additional qsub options.  Note that the
+qsub options -cwd, -r, -S, -sync and -wd are specified by other options within 
+this script and need not be passed via the -qo argument.  For a complete list 
+of all of the options that can be used with qsub run 'man qsub'.
+
+=item B<-wd|workingdir>
+
+Optional.  The working directory for the job.  This is set by specifying the 
+qsub option of the same name: -wd.  If the -wd is not specified, this script 
+will use the current working directory for the working directory for the job by
+passing the option '-cwd' to qsub.
+
+=item B<-d|debug>
+
+Optional.  The debug level for this script.  An explanation of the debug 
+levels is as follows:
+
+ '0'  Do not print any statements for the qarray script to STDERR.
+ '1'  Print status information for the qarray script to STDERR.
+
+=item B<-r|remove>
+
+Delete all Grid Engine log files (*.o*, *.e*, *.po* and *.pe*) created for the 
+job.  The original job submit script and master STDERR log file (if exists) 
+will be preserved.
+
+=item B<-help>
+
+Print this detailed help message and exit.
+
+=item B<-man>
+
+Print the man page for this script.
+
+=back
+
+=head1 DESCRIPTION
+
+B<This program> will read an input text file and convert the contents into
+a task array to be submitted to Grid Engine.  The wrapper implements best 
+practices for task array submissions within Grid Engine.  Each line of the
+input text file should be a command that will be run as a task within the
+task array.  Multiple lines (commands) within the input file can also be 
+"chunked" or grouped together as a single task wihtin the array.  For more
+information about task array refer to the -t and -tc options within the 
+qsub man page.
+
+This script assumes that you have the appropriate Grid Engine environment 
+variables present in your shell environment.  This is typically accomplished by 
+sourcing $SGE_ROOT/default/common/settings.(sh|csh).
+
+=cut 
